@@ -344,15 +344,137 @@ class PageAnalyser:
         self.session = requests.Session()
         self.session.headers.update({"User-Agent": USER_AGENT})
 
+    def _transliterate_bg_to_lat(self, text: str) -> str:
+        """Transliterate Bulgarian Cyrillic to Latin for URL matching."""
+        translit_map = {
+            'а': 'a', 'б': 'b', 'в': 'v', 'г': 'g', 'д': 'd', 'е': 'e', 'ж': 'zh',
+            'з': 'z', 'и': 'i', 'й': 'y', 'к': 'k', 'л': 'l', 'м': 'm', 'н': 'n',
+            'о': 'o', 'п': 'p', 'р': 'r', 'с': 's', 'т': 't', 'у': 'u', 'ф': 'f',
+            'х': 'h', 'ц': 'ts', 'ч': 'ch', 'ш': 'sh', 'щ': 'sht', 'ъ': 'a', 'ь': '',
+            'ю': 'yu', 'я': 'ya', ' ': '-'
+        }
+        result = ''.join(translit_map.get(c, c) for c in text.lower())
+        return result
+
+    def _fetch_sitemap_urls(self, base_url: str) -> list:
+        """Fetch and parse sitemap to get all URLs."""
+        parsed = urllib.parse.urlparse(base_url)
+        base_domain = f"{parsed.scheme}://{parsed.netloc}"
+
+        sitemap_locations = [
+            f"{base_domain}/sitemap.xml",
+            f"{base_domain}/sitemap_index.xml",
+            f"{base_domain}/sitemap-index.xml",
+            f"{base_domain}/wp-sitemap.xml",  # WordPress
+            f"{base_domain}/sitemap/sitemap.xml",
+        ]
+
+        urls = []
+
+        for sitemap_url in sitemap_locations:
+            try:
+                resp = self.session.get(sitemap_url, timeout=10)
+                if resp.status_code != 200:
+                    continue
+
+                soup = BeautifulSoup(resp.text, "lxml-xml")
+
+                # Check if it's a sitemap index (contains other sitemaps)
+                sitemaps = soup.find_all("sitemap")
+                if sitemaps:
+                    # It's a sitemap index, fetch child sitemaps
+                    for sm in sitemaps[:5]:  # Limit to first 5 sitemaps
+                        loc = sm.find("loc")
+                        if loc:
+                            try:
+                                child_resp = self.session.get(loc.text.strip(), timeout=10)
+                                if child_resp.status_code == 200:
+                                    child_soup = BeautifulSoup(child_resp.text, "lxml-xml")
+                                    for url_tag in child_soup.find_all("url"):
+                                        loc_tag = url_tag.find("loc")
+                                        if loc_tag:
+                                            urls.append(loc_tag.text.strip())
+                            except:
+                                pass
+                else:
+                    # Regular sitemap
+                    for url_tag in soup.find_all("url"):
+                        loc = url_tag.find("loc")
+                        if loc:
+                            urls.append(loc.text.strip())
+
+                if urls:
+                    log.info(f"    Found sitemap with {len(urls)} URLs")
+                    break
+
+            except Exception as e:
+                continue
+
+        return urls
+
     def find_best_page_for_keyword(self, base_url: str, keyword: str) -> str:
         """
-        Find the most relevant page for a keyword on a competitor site.
-        1. Crawl homepage and extract all internal links
-        2. Score links based on keyword relevance in URL and anchor text
-        3. Return the best matching URL, or homepage if nothing better found
+        Find the most relevant page for a keyword on a site.
+        1. First check sitemap for matching URLs
+        2. Fall back to crawling homepage and extracting links
+        3. Score based on keyword relevance in URL
         """
         log.info(f"    Searching for best page matching '{keyword}'...")
 
+        # Normalize keyword for matching
+        keyword_lower = keyword.lower()
+        keyword_parts = keyword_lower.split()
+
+        # Transliterate Bulgarian to Latin for URL matching
+        keyword_translit = self._transliterate_bg_to_lat(keyword_lower)
+        keyword_translit_parts = keyword_translit.split('-')
+        keyword_translit_alt = keyword_translit.replace('-', '')
+
+        # --- Step 1: Try sitemap first ---
+        sitemap_urls = self._fetch_sitemap_urls(base_url)
+        if sitemap_urls:
+            sitemap_candidates = []
+            for url in sitemap_urls:
+                url_lower = url.lower()
+                url_decoded = urllib.parse.unquote(url_lower)
+                score = 0
+
+                # Check for exact keyword match in URL (Cyrillic)
+                if keyword_lower.replace(' ', '-') in url_decoded:
+                    score += 100
+                if keyword_lower.replace(' ', '') in url_decoded:
+                    score += 80
+
+                # Check for transliterated match
+                if keyword_translit in url_lower:
+                    score += 90
+                if keyword_translit_alt in url_lower:
+                    score += 70
+
+                # Check for partial matches (each word)
+                for part in keyword_translit_parts:
+                    if len(part) > 2 and part in url_lower:
+                        score += 15
+
+                # Prefer category/collection pages
+                if any(x in url_lower for x in ['/category/', '/product-category/', '/collection/', '/katalog/']):
+                    score += 20
+
+                # Penalize product pages (too specific)
+                if '/product/' in url_lower and '/product-category/' not in url_lower:
+                    score -= 30
+
+                if score > 0:
+                    sitemap_candidates.append((score, url))
+
+            if sitemap_candidates:
+                sitemap_candidates.sort(key=lambda x: x[0], reverse=True)
+                best_score, best_url = sitemap_candidates[0]
+                if best_score >= 50:
+                    log.info(f"    Found in sitemap (score={best_score}): {best_url}")
+                    return best_url
+
+        # --- Step 2: Fall back to crawling homepage ---
         try:
             resp = self.session.get(base_url, timeout=self.config["request_timeout"])
             if resp.status_code != 200:
@@ -362,26 +484,11 @@ class PageAnalyser:
             parsed_base = urllib.parse.urlparse(base_url)
             base_domain = parsed_base.netloc.replace("www.", "")
 
-            # Normalize keyword for matching
-            keyword_lower = keyword.lower()
-            keyword_parts = keyword_lower.split()
-
-            # Transliterate Bulgarian to Latin for URL matching
-            translit_map = {
-                'а': 'a', 'б': 'b', 'в': 'v', 'г': 'g', 'д': 'd', 'е': 'e', 'ж': 'zh',
-                'з': 'z', 'и': 'i', 'й': 'y', 'к': 'k', 'л': 'l', 'м': 'm', 'н': 'n',
-                'о': 'o', 'п': 'p', 'р': 'r', 'с': 's', 'т': 't', 'у': 'u', 'ф': 'f',
-                'х': 'h', 'ц': 'ts', 'ч': 'ch', 'ш': 'sh', 'щ': 'sht', 'ъ': 'a', 'ь': '',
-                'ю': 'yu', 'я': 'ya', ' ': '-'
-            }
-            keyword_translit = ''.join(translit_map.get(c, c) for c in keyword_lower)
-            keyword_translit_alt = keyword_translit.replace('-', '')
-
             # Common URL patterns to try
             url_patterns = [
-                keyword_translit,           # spalno-belyo
-                keyword_translit_alt,       # spalnobelyo
-                keyword_translit.replace('-', '_'),  # spalno_belyo
+                keyword_translit,           # spalno-belyo-pamuchen-saten
+                keyword_translit_alt,       # spalnobeyopamuchensaten
+                keyword_translit.replace('-', '_'),  # spalno_belyo_pamuchen_saten
             ]
 
             candidates = []
@@ -400,31 +507,38 @@ class PageAnalyser:
                     continue
 
                 url_path = urllib.parse.urlparse(full_url).path.lower()
+                url_decoded = urllib.parse.unquote(url_path)
                 anchor_text = a.get_text(strip=True).lower()
 
                 score = 0
 
-                # Score based on URL path matching
+                # Check for Cyrillic keyword in URL (URL-decoded)
+                if keyword_lower.replace(' ', '-') in url_decoded:
+                    score += 80
+                if keyword_lower.replace(' ', '') in url_decoded:
+                    score += 60
+
+                # Score based on URL path matching (transliterated)
                 for pattern in url_patterns:
                     if pattern in url_path:
-                        score += 50
+                        score += 70
                         break
 
                 # Score based on anchor text containing keyword
                 if keyword_lower in anchor_text:
                     score += 40
 
-                # Partial keyword matches
-                for part in keyword_parts:
+                # Partial keyword matches (transliterated)
+                for part in keyword_translit_parts:
                     if len(part) > 2:
                         if part in url_path:
-                            score += 10
+                            score += 15
                         if part in anchor_text:
                             score += 10
 
                 # Prefer category/collection pages
                 if any(x in url_path for x in ['/category/', '/categories/', '/collection/', '/product-category/', '/katalog/', '/produkti/']):
-                    score += 15
+                    score += 20
 
                 # Penalize very long URLs (likely product pages)
                 if url_path.count('/') > 4:
@@ -1072,6 +1186,19 @@ Based on ALL the data above, provide a detailed, prioritized action plan:
 - Specific H2 headings to add
 - Content sections to create
 
+<h3>8. Article Suggestions / Content Gap</h3>
+Based on competitor content and keyword analysis, suggest NEW articles to create:
+- Identify content gaps (topics competitors cover that I don't have)
+- Suggest 5-10 specific article ideas with target keywords
+- For each article provide:
+  * Title suggestion
+  * Target keyword (long-tail variation)
+  * Article type (blog, guide, FAQ, comparison, product)
+  * Why this article would help (search intent, content gap, etc.)
+  * Priority (high/medium/low based on SEO opportunity)
+- Consider related keywords and search intent variations
+- Focus on articles that would support the main keyword "{keyword}"
+
 Format as clean HTML with tables, lists, and emphasis where appropriate.
 Be specific and actionable - reference actual data from the crawl.
 """)
@@ -1136,7 +1263,7 @@ Be specific and actionable - reference actual data from the crawl.
 # ---------------------------------------------------------------------------
 
 class ReportGenerator:
-    """Generate a comprehensive Markdown report."""
+    """Generate a comprehensive plain text report."""
 
     @staticmethod
     def generate(
@@ -1144,136 +1271,234 @@ class ReportGenerator:
         competitors: list[PageAnalysis], serp_results: list[SERPResult],
         own_serp: Optional[SERPResult], ai_suggestions: str,
     ) -> str:
-        """Build the full Markdown report."""
+        """Build the full plain text report."""
 
         now = datetime.now().strftime("%Y-%m-%d %H:%M")
-        own_position = own_serp.position if own_serp else "Not in top results"
+        own_position = own_serp.position if own_serp else "Not ranking"
 
         # Count issues by severity
         critical = sum(1 for i in (own_page.issues if own_page else []) if i.severity == "critical")
         warnings = sum(1 for i in (own_page.issues if own_page else []) if i.severity == "warning")
         infos = sum(1 for i in (own_page.issues if own_page else []) if i.severity == "info")
 
-        # Build SERP table
-        serp_rows = ""
-        for sr in serp_results:
-            is_own = "★" if own_domain.replace("www.", "") in sr.domain else ""
-            serp_rows += f"| {sr.position} | {is_own} {sr.domain} | [{sr.title or sr.url[:50]}]({sr.url}) |\n"
-
-        # Build issues list
-        issues_list = ""
-        if own_page:
-            for issue in own_page.issues:
-                severity_icon = {"critical": "🔴", "warning": "🟡", "info": "🔵"}.get(issue.severity, "⚪")
-                issues_list += f"| {severity_icon} **{issue.severity.upper()}** | {issue.category} | {issue.message} | {issue.suggestion} |\n"
-
         # Build comparison table
-        comparison_rows = ""
         all_pages = []
         if own_page:
             all_pages.append(own_page)
         all_pages.extend(competitors)
 
+        # Convert HTML AI suggestions to plain text
+        ai_text = ReportGenerator._html_to_text(ai_suggestions)
+
+        # Build the report
+        line = "=" * 80
+        line2 = "-" * 80
+
+        report = f"""
+{line}
+                        SEO AUDIT REPORT
+{line}
+
+Keyword:    {keyword}
+Domain:     {own_domain}
+URL:        {own_page.url if own_page else 'N/A'}
+Generated:  {now}
+
+{line}
+                           SUMMARY
+{line}
+
+  SERP Position:      {own_position}
+  Word Count:         {own_page.word_count if own_page else 'N/A'}
+  Competitors:        {len(competitors)}
+
+  Critical Issues:    {critical}
+  Warnings:           {warnings}
+  Info:               {infos}
+
+{line}
+                    KEYWORD ANALYSIS
+{line}
+
+"""
+        # Keyword analysis table
+        report += f"  {'SITE':<30} {'KW IN TITLE':<12} {'KW IN H1':<10} {'KW COUNT':<10} {'WORDS':<8}\n"
+        report += f"  {'-'*30} {'-'*12} {'-'*10} {'-'*10} {'-'*8}\n"
+
         for p in all_pages:
-            own_marker = " ★" if p.is_own_page else ""
-            kw_title = "✓" if getattr(p, 'keyword_in_title', False) else "✗"
-            kw_h1 = "✓" if getattr(p, 'keyword_in_h1', False) else "✗"
+            marker = " (YOU)" if p.is_own_page else ""
+            domain = (p.domain + marker)[:30]
+            kw_title = "YES" if getattr(p, 'keyword_in_title', False) else "NO"
+            kw_h1 = "YES" if getattr(p, 'keyword_in_h1', False) else "NO"
             kw_count = getattr(p, 'keyword_count', 0)
-            comparison_rows += f"| #{p.serp_position or '-'} | {p.domain}{own_marker} | {len(p.title)} | {len(p.meta_description)} | {len(p.h1_tags)} | {len(p.h2_tags)} | {p.word_count} | {kw_title} | {kw_h1} | {kw_count}x | {', '.join(p.schema_types[:3]) or 'None'} |\n"
+            report += f"  {domain:<30} {kw_title:<12} {kw_h1:<10} {kw_count:<10} {p.word_count:<8}\n"
 
-        # Convert HTML AI suggestions to Markdown
-        ai_md = ReportGenerator._html_to_markdown(ai_suggestions)
+        report += f"""
 
-        report = f"""# SEO Audit Report
+{line}
+                    PAGE COMPARISON
+{line}
 
-**Keyword:** "{keyword}"
-**Domain:** {own_domain}
-**Generated:** {now}
-**Server:** {os.uname().nodename}
+"""
+        # Detailed comparison
+        report += f"  {'SITE':<25} {'TITLE':<8} {'META':<8} {'H1s':<5} {'H2s':<5} {'IMAGES':<12} {'SCHEMA':<10}\n"
+        report += f"  {'-'*25} {'-'*8} {'-'*8} {'-'*5} {'-'*5} {'-'*12} {'-'*10}\n"
 
----
+        for p in all_pages:
+            marker = " *" if p.is_own_page else ""
+            domain = (p.domain[:23] + marker)
+            images = f"{p.images_total} ({p.images_missing_alt} no alt)"
+            schema = ', '.join(p.schema_types[:2]) if p.schema_types else "None"
+            report += f"  {domain:<25} {len(p.title):<8} {len(p.meta_description):<8} {len(p.h1_tags):<5} {len(p.h2_tags):<5} {images:<12} {schema:<10}\n"
 
-## Summary
+        report += f"""
 
-| Metric | Value |
-|--------|-------|
-| SERP Position | {own_position} |
-| Critical Issues | {critical} |
-| Warnings | {warnings} |
-| Info | {infos} |
-| Word Count | {own_page.word_count if own_page else 'N/A'} |
-| Competitors Analysed | {len(competitors)} |
+{line}
+                    SEO ISSUES FOUND
+{line}
 
----
+"""
+        if own_page and own_page.issues:
+            report += f"  {'SEVERITY':<10} {'CATEGORY':<15} {'ISSUE':<50}\n"
+            report += f"  {'-'*10} {'-'*15} {'-'*50}\n"
+            for issue in own_page.issues:
+                severity = issue.severity.upper()
+                # Truncate long messages
+                msg = issue.message[:48] + '..' if len(issue.message) > 50 else issue.message
+                report += f"  {severity:<10} {issue.category:<15} {msg:<50}\n"
 
-## Side-by-Side Comparison
+            report += f"\n  RECOMMENDED FIXES:\n"
+            report += f"  {'-'*70}\n"
+            for i, issue in enumerate(own_page.issues, 1):
+                report += f"  {i}. [{issue.severity.upper()}] {issue.message}\n"
+                report += f"     -> {issue.suggestion}\n\n"
+        else:
+            report += "  No issues found! Your page is well optimized.\n"
 
-| # | Domain | Title | Meta | H1s | H2s | Words | KW Title | KW H1 | KW Count | Schema |
-|---|--------|-------|------|-----|-----|-------|----------|-------|----------|--------|
-{comparison_rows}
+        report += f"""
+{line}
+                    YOUR PAGE DETAILS
+{line}
 
----
+"""
+        if own_page:
+            report += f"""  URL:              {own_page.url}
+  Title:            {own_page.title}
+  Title Length:     {len(own_page.title)} chars
 
-## SEO Issues Found
+  Meta Description: {own_page.meta_description[:100]}{'...' if len(own_page.meta_description) > 100 else ''}
+  Meta Length:      {len(own_page.meta_description)} chars
 
-| Severity | Category | Issue | Suggestion |
-|----------|----------|-------|------------|
-{issues_list if issues_list else "| ✅ | - | No issues found | - |"}
+  H1 Tags:          {', '.join(own_page.h1_tags) or 'None'}
+  H2 Tags:          {', '.join(own_page.h2_tags[:5]) or 'None'}
 
----
+  Word Count:       {own_page.word_count}
+  Images:           {own_page.images_total} total, {own_page.images_missing_alt} missing alt text
+  Internal Links:   {own_page.internal_links}
+  External Links:   {own_page.external_links}
+  Load Time:        {own_page.load_time}s
+  Page Size:        {own_page.page_size_kb} KB
 
-## AI Content Suggestions
+  Open Graph:       {'Yes' if own_page.has_og_tags else 'No'}
+  Twitter Cards:    {'Yes' if own_page.has_twitter_cards else 'No'}
+  Schema Markup:    {', '.join(own_page.schema_types) or 'None'}
+"""
 
-{ai_md}
+        report += f"""
 
----
+{line}
+                    COMPETITOR DETAILS
+{line}
+"""
+        for i, cp in enumerate(competitors, 1):
+            report += f"""
+  --- Competitor #{i}: {cp.domain} ---
+  URL:              {cp.url}
+  Title:            {cp.title}
+  Meta:             {cp.meta_description[:80]}{'...' if len(cp.meta_description) > 80 else ''}
+  H1:               {', '.join(cp.h1_tags) or 'None'}
+  H2s:              {', '.join(cp.h2_tags[:3]) or 'None'}
+  Words:            {cp.word_count}
+  Keyword Count:    {getattr(cp, 'keyword_count', 0)}
+"""
 
-{"## Google SERP Results" + chr(10) + chr(10) + "| # | Domain | Page |" + chr(10) + "|---|--------|------|" + chr(10) + serp_rows + chr(10) + "---" + chr(10) if serp_rows else ""}
+        report += f"""
 
-*Generated by SEO Competitive Auditor v1.1*
+{line}
+                    AI RECOMMENDATIONS
+{line}
+
+{ai_text}
+
+{line}
+                    END OF REPORT
+{line}
+Generated by SEO Competitive Auditor v1.1
 """
         return report
 
     @staticmethod
-    def _html_to_markdown(html: str) -> str:
-        """Convert HTML to Markdown."""
+    def _html_to_text(html: str) -> str:
+        """Convert HTML to clean plain text."""
         import re
 
         if not html:
-            return "*No AI suggestions available.*"
+            return "No AI suggestions available."
 
-        md = html
+        text = html
 
-        # Convert headers
-        md = re.sub(r'<h3[^>]*>(.*?)</h3>', r'### \1', md, flags=re.DOTALL)
-        md = re.sub(r'<h2[^>]*>(.*?)</h2>', r'## \1', md, flags=re.DOTALL)
-        md = re.sub(r'<h4[^>]*>(.*?)</h4>', r'#### \1', md, flags=re.DOTALL)
+        # Convert headers to uppercase with underlines
+        def replace_h3(match):
+            title = match.group(1).strip()
+            return f"\n{title.upper()}\n{'-' * len(title)}\n"
+
+        def replace_h2(match):
+            title = match.group(1).strip()
+            return f"\n{title.upper()}\n{'=' * len(title)}\n"
+
+        text = re.sub(r'<h3[^>]*>(.*?)</h3>', replace_h3, text, flags=re.DOTALL)
+        text = re.sub(r'<h2[^>]*>(.*?)</h2>', replace_h2, text, flags=re.DOTALL)
+        text = re.sub(r'<h4[^>]*>(.*?)</h4>', replace_h3, text, flags=re.DOTALL)
 
         # Convert lists
-        md = re.sub(r'<ul[^>]*>', '', md)
-        md = re.sub(r'</ul>', '', md)
-        md = re.sub(r'<li[^>]*>(.*?)</li>', r'- \1', md, flags=re.DOTALL)
+        text = re.sub(r'<ul[^>]*>', '', text)
+        text = re.sub(r'</ul>', '\n', text)
+        text = re.sub(r'<li[^>]*>(.*?)</li>', r'  • \1\n', text, flags=re.DOTALL)
 
         # Convert formatting
-        md = re.sub(r'<strong>(.*?)</strong>', r'**\1**', md, flags=re.DOTALL)
-        md = re.sub(r'<b>(.*?)</b>', r'**\1**', md, flags=re.DOTALL)
-        md = re.sub(r'<em>(.*?)</em>', r'*\1*', md, flags=re.DOTALL)
-        md = re.sub(r'<i>(.*?)</i>', r'*\1*', md, flags=re.DOTALL)
+        text = re.sub(r'<strong>(.*?)</strong>', r'\1', text, flags=re.DOTALL)
+        text = re.sub(r'<b>(.*?)</b>', r'\1', text, flags=re.DOTALL)
+        text = re.sub(r'<em>(.*?)</em>', r'\1', text, flags=re.DOTALL)
+        text = re.sub(r'<i>(.*?)</i>', r'\1', text, flags=re.DOTALL)
 
         # Convert paragraphs
-        md = re.sub(r'<p[^>]*>(.*?)</p>', r'\1\n', md, flags=re.DOTALL)
+        text = re.sub(r'<p[^>]*>(.*?)</p>', r'\1\n\n', text, flags=re.DOTALL)
+        text = re.sub(r'<br\s*/?>', '\n', text)
 
-        # Convert links
-        md = re.sub(r'<a[^>]*href="([^"]*)"[^>]*>(.*?)</a>', r'[\2](\1)', md, flags=re.DOTALL)
+        # Convert tables to simple format
+        text = re.sub(r'<table[^>]*>', '\n', text)
+        text = re.sub(r'</table>', '\n', text)
+        text = re.sub(r'<tr[^>]*>', '', text)
+        text = re.sub(r'</tr>', '\n', text)
+        text = re.sub(r'<t[dh][^>]*>(.*?)</t[dh]>', r'\1 | ', text, flags=re.DOTALL)
 
         # Remove remaining HTML tags
-        md = re.sub(r'<[^>]+>', '', md)
+        text = re.sub(r'<[^>]+>', '', text)
+
+        # Clean up HTML entities
+        text = text.replace('&lt;', '<')
+        text = text.replace('&gt;', '>')
+        text = text.replace('&amp;', '&')
+        text = text.replace('&nbsp;', ' ')
 
         # Clean up whitespace
-        md = re.sub(r'\n\s*\n\s*\n', '\n\n', md)
-        md = md.strip()
+        text = re.sub(r'\n\s*\n\s*\n', '\n\n', text)
+        text = re.sub(r'[ \t]+', ' ', text)
+        lines = [line.strip() for line in text.split('\n')]
+        text = '\n'.join(lines)
+        text = text.strip()
 
-        return md
+        return text
 
 
 # ---------------------------------------------------------------------------
@@ -1528,18 +1753,23 @@ def run_audit(keyword: str, own_domain: str, own_url: str = "", config: dict = N
             return
 
     # --- Step 2: Determine our URL ---
+    analyser = PageAnalyser(cfg)
+
     if own_url:
         our_url = own_url
     elif own_serp:
         our_url = own_serp.url
     else:
-        # Not ranking or audit-only mode — use homepage or a likely URL
-        our_url = f"https://www.{own_domain}/"
-        log.info(f"Using URL: {our_url}")
+        # Not ranking or audit-only mode — search sitemap for best matching page
+        base_url = f"https://www.{own_domain}/"
+        log.info(f"Searching for best page on {own_domain} for keyword '{keyword}'...")
+        our_url = analyser.find_best_page_for_keyword(base_url, keyword)
+        if our_url == base_url:
+            log.info(f"No specific page found, using homepage: {our_url}")
+        else:
+            log.info(f"Found matching page: {our_url}")
 
     # --- Step 3: Crawl and analyse pages ---
-    analyser = PageAnalyser(cfg)
-
     # Crawl our page (with full HTML for image analysis)
     log.info("\nAnalysing YOUR page:")
     own_page = analyser.analyse(our_url, is_own=True)
@@ -1682,7 +1912,7 @@ def run_audit(keyword: str, own_domain: str, own_url: str = "", config: dict = N
     # Save report
     os.makedirs(cfg["report_dir"], exist_ok=True)
     safe_keyword = re.sub(r"[^a-z0-9]+", "-", keyword.lower()).strip("-")
-    report_filename = f"seo-audit-{safe_keyword}-{own_domain}-{datetime.now().strftime('%Y%m%d-%H%M')}.md"
+    report_filename = f"seo-audit-{safe_keyword}-{own_domain}-{datetime.now().strftime('%Y%m%d-%H%M')}.txt"
     report_path = os.path.join(cfg["report_dir"], report_filename)
 
     with open(report_path, "w", encoding="utf-8") as f:

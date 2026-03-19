@@ -4,6 +4,12 @@
 # SEO audit reports
 reports/
 
+# Generated articles
+articles/
+
+# Scraped site URLs
+site-urls-*.json
+
 # Python
 __pycache__/
 *.py[cod]
