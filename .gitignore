@@ -10,6 +10,10 @@ articles/
 # Scraped site URLs
 site-urls-*.json
 
+# Knowledge base
+*.db
+seo-knowledge.db
+
 # Python
 __pycache__/
 *.py[cod]

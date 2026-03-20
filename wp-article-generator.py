@@ -1,14 +1,21 @@
 #!/usr/bin/env python3
 """
 ================================================================================
-WordPress Article Generator v1.0
+WordPress Article Generator v2.0
 ================================================================================
 Generates SEO-optimized articles using AI and publishes them to WordPress.
+
+Features:
+- Multiple article types: blog, guide, product, faq, comparison, case-study
+- Output formats: HTML, Elementor, WPBakery
+- Internal link building from sitemap
+- Knowledge base integration
 
 Usage:
     python3 wp-article-generator.py --keyword "спално бельо памучен сатен" --type blog
     python3 wp-article-generator.py --keyword "как да изберем спално бельо" --type guide
-    python3 wp-article-generator.py --keyword "памучен сатен" --type product --category 5
+    python3 wp-article-generator.py --keyword "памучен сатен" --type case-study --format elementor
+    python3 wp-article-generator.py --keyword "ранфорс vs сатен" --type comparison --format wpbakery
 
 Configuration:
     Set WordPress credentials in .env file:
@@ -33,6 +40,21 @@ from pathlib import Path
 from textwrap import dedent
 from base64 import b64encode
 from glob import glob
+
+# Try to import knowledge base
+HAS_KNOWLEDGE_BASE = False
+SEOKnowledgeBase = None
+try:
+    import importlib.util
+    kb_path = Path(__file__).resolve().parent / "seo-knowledge-base.py"
+    if kb_path.exists():
+        spec = importlib.util.spec_from_file_location("seo_knowledge_base", kb_path)
+        seo_kb_module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(seo_kb_module)
+        SEOKnowledgeBase = seo_kb_module.SEOKnowledgeBase
+        HAS_KNOWLEDGE_BASE = True
+except Exception:
+    pass
 
 # Load environment variables
 try:
@@ -74,6 +96,93 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 log = logging.getLogger("wp-generator")
+
+
+# ==============================================================================
+# Output Format Templates
+# ==============================================================================
+
+class OutputFormats:
+    """Templates for different page builder formats."""
+
+    @staticmethod
+    def get_format_instructions(format_type: str) -> str:
+        """Get formatting instructions for the specified output format."""
+
+        formats = {
+            "html": """
+OUTPUT FORMAT: Clean Responsive HTML
+Use semantic HTML5 with inline responsive styles:
+- Use <section>, <article>, <aside> elements
+- Include responsive CSS in style attributes or <style> block
+- Use max-width, flexbox, and media queries for responsiveness
+- Tables should have overflow-x: auto wrapper for mobile
+- Images should have max-width: 100%; height: auto;
+- Use relative units (rem, em, %) over pixels
+
+Example structure:
+<style>
+.article-section { max-width: 1200px; margin: 0 auto; padding: 20px; }
+.comparison-table { width: 100%; overflow-x: auto; }
+.feature-grid { display: flex; flex-wrap: wrap; gap: 20px; }
+.feature-card { flex: 1 1 300px; padding: 20px; background: #f8f9fa; border-radius: 8px; }
+@media (max-width: 768px) { .feature-card { flex: 1 1 100%; } }
+</style>
+""",
+            "elementor": """
+OUTPUT FORMAT: Elementor-Compatible HTML
+Structure content for Elementor page builder widgets:
+- Use [elementor-template] shortcodes where appropriate
+- Structure sections with data-elementor attributes
+- Use CSS classes that map to Elementor styles:
+  * elementor-section, elementor-column, elementor-widget
+  * elementor-heading-title, elementor-text-editor
+  * elementor-icon-box, elementor-image-box
+  * elementor-accordion, elementor-tabs
+  * elementor-counter, elementor-progress-bar
+
+Include Elementor widget comments for easy copy-paste:
+<!-- Elementor: Section with 2 columns -->
+<!-- Elementor: Icon Box widget -->
+<!-- Elementor: Comparison Table widget -->
+<!-- Elementor: Accordion/FAQ widget -->
+<!-- Elementor: Call to Action widget -->
+
+Use these CSS classes for styling:
+.elementor-section { padding: 40px 0; }
+.elementor-column-33 { width: 33.33%; }
+.elementor-column-50 { width: 50%; }
+.elementor-cta { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); }
+""",
+            "wpbakery": """
+OUTPUT FORMAT: WPBakery (Visual Composer) Compatible
+Structure content using WPBakery shortcode format:
+[vc_row][vc_column width="1/2"]content[/vc_column][/vc_row]
+
+Common shortcodes to use:
+- [vc_row] [vc_column] - Row and column structure
+- [vc_column_text] - Text blocks
+- [vc_single_image] - Images
+- [vc_separator] - Dividers
+- [vc_tta_accordion] [vc_tta_section] - Accordions/FAQs
+- [vc_tta_tabs] - Tabs
+- [vc_btn] - Buttons/CTAs
+- [vc_icon] - Icons
+- [vc_progress_bar] - Progress bars
+- [vc_pie] - Pie charts
+- [vc_custom_heading] - Styled headings
+
+Example structure:
+[vc_row][vc_column]
+[vc_custom_heading text="Title" font_container="tag:h2|text_align:center"]
+[vc_column_text]Content here[/vc_column_text]
+[/vc_column][/vc_row]
+
+[vc_row][vc_column width="1/3"]Card 1[/vc_column][vc_column width="1/3"]Card 2[/vc_column][vc_column width="1/3"]Card 3[/vc_column][/vc_row]
+"""
+        }
+
+        return formats.get(format_type, formats["html"])
 
 
 # ==============================================================================
@@ -219,14 +328,24 @@ class AIContentGenerator:
         domain = CONFIG["wp_url"].replace("https://", "").replace("http://", "").split("/")[0]
         self.site_urls = SiteURLDatabase(domain)
 
+        # Load knowledge base if available
+        self.knowledge_base = None
+        if HAS_KNOWLEDGE_BASE:
+            try:
+                self.knowledge_base = SEOKnowledgeBase()
+                log.info("Knowledge base loaded")
+            except Exception as e:
+                log.debug(f"Could not load knowledge base: {e}")
+
     def generate_article(self, keyword: str, article_type: str = "blog",
-                         language: str = "bg", extra_context: str = "") -> dict:
+                         language: str = "bg", extra_context: str = "",
+                         output_format: str = "html") -> dict:
         """Generate a complete article structure."""
 
         if not self.enabled:
             return None
 
-        prompt = self._build_prompt(keyword, article_type, language, extra_context)
+        prompt = self._build_prompt(keyword, article_type, language, extra_context, output_format)
 
         log.info(f"Generating {article_type} article for: '{keyword}'...")
 
@@ -236,14 +355,45 @@ class AIContentGenerator:
             response = self._call_openai(prompt)
 
         # Parse the JSON response
+        if not response:
+            log.error("Empty response from AI")
+            return None
+
         try:
-            # Extract JSON from response
-            json_match = re.search(r'\{[\s\S]*\}', response)
-            if json_match:
-                article_data = json.loads(json_match.group())
+            # Extract JSON from response - find the outermost { }
+            # Handle nested braces correctly
+            depth = 0
+            start_idx = -1
+            end_idx = -1
+
+            for i, char in enumerate(response):
+                if char == '{':
+                    if depth == 0:
+                        start_idx = i
+                    depth += 1
+                elif char == '}':
+                    depth -= 1
+                    if depth == 0 and start_idx != -1:
+                        end_idx = i + 1
+                        break
+
+            if start_idx != -1 and end_idx != -1:
+                json_str = response[start_idx:end_idx]
+                article_data = json.loads(json_str)
                 return article_data
+            else:
+                log.warning("No JSON found in response, using raw content")
+                return {
+                    "title": f"Article about {keyword}",
+                    "content": response,
+                    "excerpt": "",
+                    "meta_description": "",
+                    "focus_keyword": keyword,
+                    "tags": [keyword],
+                }
         except json.JSONDecodeError as e:
             log.error(f"Failed to parse AI response as JSON: {e}")
+            log.debug(f"Response preview: {response[:500]}...")
             # Return raw content as fallback
             return {
                 "title": f"Article about {keyword}",
@@ -254,14 +404,31 @@ class AIContentGenerator:
                 "tags": [keyword],
             }
 
-        return None
-
-    def _build_prompt(self, keyword: str, article_type: str, language: str, extra_context: str) -> str:
+    def _build_prompt(self, keyword: str, article_type: str, language: str, extra_context: str, output_format: str = "html") -> str:
         """Build the article generation prompt."""
 
-        # Find relevant internal links
+        # Get knowledge base context
+        kb_context_section = ""
+        if self.knowledge_base:
+            try:
+                kb_context = self.knowledge_base.format_context_for_prompt(keyword)
+                if kb_context:
+                    kb_context_section = f"""
+SITE KNOWLEDGE BASE:
+{kb_context}
+
+IMPORTANT INSTRUCTIONS:
+- DO NOT duplicate existing content - create something NEW and COMPLEMENTARY
+- If similar articles exist, focus on a different angle or aspect
+- Use the available pages for internal linking
+- Consider the current SERP ranking when writing
+"""
+            except Exception as e:
+                log.debug(f"Could not get KB context: {e}")
+
+        # Find relevant internal links (fallback if KB not available)
         internal_links_section = ""
-        if self.site_urls.loaded:
+        if not kb_context_section and self.site_urls.loaded:
             relevant_urls = self.site_urls.find_relevant_urls(keyword, max_results=15)
             if relevant_urls:
                 links_list = "\n".join([
@@ -314,6 +481,21 @@ Use <a href="URL">anchor text</a> format with relevant anchor text.
                 - Has 1200-1800 words
                 - Helps readers make informed decisions
             """,
+            "case-study": """
+                Write a comprehensive case-study/deep-dive article that:
+                - Is extremely detailed and authoritative (2500-4000 words)
+                - Includes technical data, statistics, and expert insights
+                - Has clear sections with H2 and H3 hierarchy
+                - Contains comparison tables with detailed specifications
+                - Includes visual elements (charts, infographics descriptions)
+                - Has FAQ section at the end (8-12 questions)
+                - Provides actionable recommendations
+                - Uses storytelling and real-world examples
+                - Establishes thought leadership on the topic
+                - Contains multiple CTAs throughout
+                - HEAVILY focuses on internal linking (10-15 links)
+                - Targets multiple related long-tail keywords
+            """,
         }
 
         type_instruction = type_instructions.get(article_type, type_instructions["blog"])
@@ -331,6 +513,8 @@ Use <a href="URL">anchor text</a> format with relevant anchor text.
 
             {f"ADDITIONAL CONTEXT: {extra_context}" if extra_context else ""}
 
+            {kb_context_section}
+
             {internal_links_section}
 
             SEO REQUIREMENTS:
@@ -345,12 +529,15 @@ Use <a href="URL">anchor text</a> format with relevant anchor text.
             - Include 3-5 internal links using the REAL URLs provided above (if available)
             - Use descriptive anchor text for internal links
 
+            {OutputFormats.get_format_instructions(output_format)}
+
             FORMATTING:
             - Use HTML formatting (h2, h3, p, ul, li, strong, em, table)
             - Do NOT use h1 (WordPress adds this from title)
             - Use short paragraphs (2-4 sentences)
             - Include bullet points and lists where appropriate
             - Add a compelling introduction and conclusion
+            - Make ALL content responsive for mobile devices
 
             RESPOND WITH VALID JSON ONLY (no markdown, no code blocks):
             {{
@@ -380,7 +567,7 @@ Use <a href="URL">anchor text</a> format with relevant anchor text.
 
             response = client.messages.create(
                 model=model,
-                max_tokens=8000,
+                max_tokens=16000,
                 messages=[{"role": "user", "content": prompt}],
             )
             return response.content[0].text
@@ -638,8 +825,8 @@ def main():
             Examples:
               python3 wp-article-generator.py --keyword "спално бельо памучен сатен" --type blog
               python3 wp-article-generator.py --keyword "как да изберем спално бельо" --type guide
-              python3 wp-article-generator.py --keyword "памучен сатен" --type product --publish
-              python3 wp-article-generator.py --keyword "ранфорс vs сатен" --type comparison
+              python3 wp-article-generator.py --keyword "памучен сатен" --type case-study --format elementor
+              python3 wp-article-generator.py --keyword "ранфорс vs сатен" --type comparison --format wpbakery
 
             Article Types:
               blog        - Informative blog post (1000-1500 words)
@@ -647,13 +834,22 @@ def main():
               product     - Product category description (800-1200 words)
               faq         - FAQ article (8-12 questions)
               comparison  - Comparison article (1200-1800 words)
+              case-study  - Deep-dive comprehensive article (2500-4000 words)
+
+            Output Formats:
+              html        - Clean responsive HTML (default)
+              elementor   - Elementor widget-compatible structure
+              wpbakery    - WPBakery/Visual Composer shortcodes
         """)
     )
 
     parser.add_argument("-k", "--keyword", required=True, help="Target keyword for the article")
     parser.add_argument("-t", "--type", default="blog",
-                        choices=["blog", "guide", "product", "faq", "comparison"],
+                        choices=["blog", "guide", "product", "faq", "comparison", "case-study"],
                         help="Article type (default: blog)")
+    parser.add_argument("-f", "--format", default="html",
+                        choices=["html", "elementor", "wpbakery"],
+                        help="Output format (default: html)")
     parser.add_argument("-l", "--language", default="bg", help="Language code (default: bg)")
     parser.add_argument("-c", "--category", type=int, nargs="+", help="WordPress category ID(s)")
     parser.add_argument("--context", default="", help="Additional context for AI")
@@ -687,7 +883,8 @@ def main():
         keyword=args.keyword,
         article_type=args.type,
         language=args.language,
-        extra_context=args.context
+        extra_context=args.context,
+        output_format=args.format
     )
 
     if not article:
